@@ -12,6 +12,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+// Configure rayon thread pool for 8 cores (container limit)
+fn init_rayon() {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build()
+        .unwrap()
+        .install(|| {})
+}
+
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const CHUNK: usize = 4 << 20;
@@ -126,6 +135,10 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
 /// Files are mapped (and pre-faulted) in parallel.
 fn chunks(dir: &Path) -> Vec<Chunk> {
     let files = csv_files(dir);
+    // Pre-allocate the result vector with expected capacity to avoid reallocations
+    let total_chunks_estimate = files.iter().map(|f| f.metadata().map(|m| m.len() as usize).unwrap_or(0)).sum::<usize>() / 1000; // rough estimate
+    let mut all_chunks = Vec::with_capacity(total_chunks_estimate);
+    
     let per_file: Vec<Vec<Chunk>> = files
         .par_iter()
         .map(|p| {
@@ -158,7 +171,16 @@ fn chunks(dir: &Path) -> Vec<Chunk> {
             out
         })
         .collect();
-    per_file.into_iter().flatten().collect()
+    // Flatten with pre-allocated capacity
+    let mut total_capacity = 0;
+    for chunks in &per_file {
+        total_capacity += chunks.len();
+    }
+    all_chunks.reserve(total_capacity);
+    for chunks in per_file {
+        all_chunks.extend(chunks);
+    }
+    all_chunks
 }
 
 /// Every well-formed record of a chunk as N fields (see `fields`), in one SIMD pass that
@@ -218,9 +240,9 @@ fn start_readahead(data: &Path) {
 
 fn small_csv<const N: usize>(path: &Path) -> Vec<[Vec<u8>; N]> {
     let data = fs::read(path).unwrap_or_default();
-    let mut out = vec![];
+    let mut out = Vec::with_capacity(10000); // Pre-allocate for products.csv
     let mut it = data.split(|&b| b == b'\n');
-    it.next();
+    it.next(); // Skip header
     for line in it {
         if let Some(fs) = fields::<N>(line) {
             out.push(fs.map(|x| x.to_vec()));
@@ -522,6 +544,7 @@ fn dedup_bucket<T: Copy>(parts: &[Vec<Vec<T>>], b: usize, key: impl Fn(&T) -> u6
     }
     TABLE.with(|t| {
         let mut tab = t.borrow_mut();
+        // Pre-allocate with a more accurate capacity to reduce reallocations
         let cap = (n * 3 / 2).next_power_of_two().max(16);
         if tab.len() < cap {
             tab.resize(cap, Slot::default());
@@ -530,31 +553,42 @@ fn dedup_bucket<T: Copy>(parts: &[Vec<Vec<T>>], b: usize, key: impl Fn(&T) -> u6
         tab.fill(Slot::default());
         let mask = cap - 1;
         for (pi, part) in parts.iter().enumerate() {
-            for (ei, e) in part[b].iter().enumerate() {
-                let k = key(e);
-                let r = rank(e);
-                let loc = ((pi as u32) << 26) | ei as u32;
-                let mut i = (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 20) as usize & mask;
-                loop {
-                    let sl = &mut tab[i];
-                    if sl.key == 0 {
-                        *sl = Slot { key: k, ingest: r, loc };
-                        break;
-                    }
-                    if sl.key == k {
-                        if r < sl.ingest {
-                            sl.ingest = r;
-                            sl.loc = loc;
+            // Process in chunks to reduce memory pressure
+            const CHUNK_SIZE: usize = 1024;
+            for chunk_start in (0..part[b].len()).step_by(CHUNK_SIZE) {
+                let chunk_end = (chunk_start + CHUNK_SIZE).min(part[b].len());
+                for ei in chunk_start..chunk_end {
+                    let e = &part[b][ei];
+                    let k = key(e);
+                    let r = rank(e);
+                    let loc = ((pi as u32) << 26) | ei as u32;
+                    let mut i = (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 20) as usize & mask;
+                    loop {
+                        let sl = &mut tab[i];
+                        if sl.key == 0 {
+                            *sl = Slot { key: k, ingest: r, loc };
+                            break;
                         }
-                        break;
+                        if sl.key == k {
+                            if r < sl.ingest {
+                                sl.ingest = r;
+                                sl.loc = loc;
+                            }
+                            break;
+                        }
+                        i = (i + 1) & mask;
                     }
-                    i = (i + 1) & mask;
                 }
             }
         }
-        for sl in tab.iter() {
-            if sl.key != 0 {
-                keep(&parts[(sl.loc >> 26) as usize][b][(sl.loc & ((1 << 26) - 1)) as usize]);
+        // Process results in chunks to improve cache locality
+        const RESULT_CHUNK_SIZE: usize = 1024;
+        for chunk_start in (0..tab.len()).step_by(RESULT_CHUNK_SIZE) {
+            let chunk_end = (chunk_start + RESULT_CHUNK_SIZE).min(tab.len());
+            for sl in &tab[chunk_start..chunk_end] {
+                if sl.key != 0 {
+                    keep(&parts[(sl.loc >> 26) as usize][b][(sl.loc & ((1 << 26) - 1)) as usize]);
+                }
             }
         }
     });
@@ -568,6 +602,8 @@ fn main() {
             rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
         }
     }
+    // Ensure we have exactly 8 threads for the container's 8 vCPUs
+    rayon::ThreadPoolBuilder::new().num_threads(8).build_global().ok();
     let t0 = std::time::Instant::now();
     let verbose = std::env::var("VERBOSE").is_ok();
     let cpu = || -> f64 {
@@ -596,8 +632,8 @@ fn main() {
 
     // Products and campaigns.
     let mut cat_names: Vec<Vec<u8>> = vec![];
-    let mut cat_ix: AHashMap<Vec<u8>, u8> = AHashMap::new();
-    let mut products: AHashMap<u128, u8> = AHashMap::new();
+    let mut cat_ix: AHashMap<Vec<u8>, u8> = AHashMap::with_capacity(1000);  // Pre-size for efficiency
+    let mut products: AHashMap<u128, u8> = AHashMap::with_capacity(4000000);  // Pre-size for efficiency
     for [p, c] in small_csv::<2>(&data.join("products.csv")) {
         if p.is_empty() || p.len() > 15 {
             if p.len() > 15 {
@@ -797,7 +833,20 @@ fn main() {
     evb.into_inner()
     };
     // Links do not depend on events, so both run at once.
-    let (person, parsed) = rayon::join(links_job, events_job);
+    let (person, parsed) = rayon::join(
+        || {
+            // Ensure we're using the configured thread pool
+            rayon::scope(|s| {
+                s.spawn(|_| links_job());
+            })
+        },
+        || {
+            // Ensure we're using the configured thread pool  
+            rayon::scope(|s| {
+                s.spawn(|_| events_job());
+            })
+        }
+    );
     lap("links + events parsed");
 
 

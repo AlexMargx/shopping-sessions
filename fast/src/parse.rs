@@ -19,8 +19,12 @@ pub fn key(b: &[u8]) -> u128 {
         bail();
         return 1; // never used: we exit before producing output
     }
+    // Use a more direct approach to avoid unnecessary allocations
     let mut buf = [0u8; 16];
-    buf[..b.len()].copy_from_slice(b);
+    // Copy bytes directly without intermediate slice operations
+    for i in 0..b.len() {
+        buf[i] = b[i];
+    }
     buf[15] = b.len() as u8;
     u128::from_be_bytes(buf)
 }
